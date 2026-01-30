@@ -3,21 +3,22 @@ import cors from "cors";
 
 const app = express();
 
-// CORS (so Vapi browser tester can hit your endpoint)
+// CORS (lets Vapi browser-based tool tester call your endpoint)
 app.use(
   cors({
-    origin: "*",
+    origin: true, // allow all origins
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-// Handle preflight requests
+// Preflight
 app.options("*", cors());
 
-app.use(express.json());
+// Parse JSON
+app.use(express.json({ limit: "2mb" }));
 
-// Simple request logger (helps confirm Vapi is hitting you)
+// Simple request logger (shows in Render logs)
 app.use((req, res, next) => {
   console.log("INCOMING:", req.method, req.url);
   next();
@@ -25,29 +26,33 @@ app.use((req, res, next) => {
 
 // Health check
 app.get("/", (req, res) => {
-  res.send("alive");
+  res.status(200).send("alive");
 });
 
-// ONE endpoint Vapi will call
+// Vapi tool webhook endpoint
 app.post("/vapi", (req, res) => {
-  const toolCallList = req.body?.message?.toolCallList || [];
+  try {
+    const toolCallList = req.body?.message?.toolCallList || [];
 
-  const results = toolCallList.map((toolCall) => {
-    return {
+    console.log("toolCallList length:", toolCallList.length);
+
+    const results = toolCallList.map((toolCall) => ({
       toolCallId: toolCall.id,
       result: {
         ok: true,
         toolName: toolCall.name,
         receivedParameters: toolCall.parameters,
       },
-    };
-  });
+    }));
 
-  res.json({ results });
+    return res.status(200).json({ results });
+  } catch (err) {
+    console.error("ERROR in /vapi:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
 });
 
-// Render provides the PORT automatically
+// Render provides PORT
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server listening on port", PORT);
-});
+app.listen(PORT, () => console.log("Server listening on port", PORT));
+
