@@ -5,21 +5,21 @@ import cors from "cors";
 // Config
 // ===============================
 
-// Optional: require a Bearer token on requests to /vapi (recommended)
+// Optional: require a Bearer token on requests to /vapi (recommended later)
 const BRIDGE_BEARER_TOKEN = process.env.BRIDGE_BEARER_TOKEN || "";
 
-// How this bridge talks to Open Dental:
-// Option A) Direct to Open Dental API: set OD_BASE_URL + OD_AUTH_HEADER
-// Option B) Forward to an internal proxy: set OD_PROXY_BASE_URL (e.g., http://127.0.0.1:5050/od/proxy)
+// Open Dental connectivity options:
 //
-// If OD_PROXY_BASE_URL is set, this server will call:
-//   `${OD_PROXY_BASE_URL}?path=${encodeURIComponent("/patients")}`
-// Otherwise it will call:
-//   `${OD_BASE_URL}/patients` with Authorization header OD_AUTH_HEADER
+// Option A (recommended on Render): direct Open Dental API
+//   OD_BASE_URL     e.g. https://api.opendental.com/api/v1
+//   OD_AUTH_HEADER  e.g. "ODFHIR developerKey/customerKey"
 //
-const OD_BASE_URL = process.env.OD_BASE_URL || ""; // e.g. https://api.opendental.com/api/v1
-const OD_AUTH_HEADER = process.env.OD_AUTH_HEADER || ""; // e.g. "ODFHIR devKey/customerKey"
-const OD_PROXY_BASE_URL = process.env.OD_PROXY_BASE_URL || ""; // e.g. http://127.0.0.1:5050/od/proxy
+// Option B: forward to another proxy (only if that proxy is publicly reachable from Render)
+//   OD_PROXY_BASE_URL e.g. https://your-internal-proxy.com/od/proxy
+//
+const OD_BASE_URL = process.env.OD_BASE_URL || "";
+const OD_AUTH_HEADER = process.env.OD_AUTH_HEADER || "";
+const OD_PROXY_BASE_URL = process.env.OD_PROXY_BASE_URL || "";
 
 const PORT = process.env.PORT || 3000;
 
@@ -67,7 +67,7 @@ function requireBearer(req, res) {
   return true;
 }
 
-// Use global fetch if available (Node 18+). If not, this will throw with a clear message.
+// Uses global fetch (Node 18+). Render typically runs Node 18+.
 async function httpJson(url, options = {}) {
   const resp = await fetch(url, options);
   const text = await resp.text();
@@ -78,18 +78,19 @@ async function httpJson(url, options = {}) {
     data = text;
   }
   if (!resp.ok) {
-    const msg =
-      typeof data === "string"
-        ? data
-        : JSON.stringify(data || {}, null, 2);
+    const msg = typeof data === "string" ? data : JSON.stringify(data || {}, null, 2);
     throw new Error(`HTTP ${resp.status} ${resp.statusText} from ${url}: ${msg}`);
   }
   return data;
 }
 
+function digitsOnly(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+
 // Build an Open Dental request either direct or via proxy
 async function odGet(path) {
-  // path like "/patients" or "/appointments?PatNum=123"
+  // path like "/patients" or "/appointments?patNum=123"
   if (OD_PROXY_BASE_URL) {
     const url = `${OD_PROXY_BASE_URL}?path=${encodeURIComponent(path)}`;
     return httpJson(url, { method: "GET" });
@@ -108,48 +109,45 @@ async function odGet(path) {
   });
 }
 
-// Normalize phone digits
-function digitsOnly(s) {
-  return String(s || "").replace(/\D/g, "");
-}
-
 // ===============================
 // Tool implementations
 // ===============================
 
+// TOOL 1 (already working): Find patient by phone or name + DOB
 async function tool_findPatient(params) {
-  // Accepts: phone OR firstName/lastName/dateOfBirth
   const phone = digitsOnly(params?.phone);
   const firstName = (params?.firstName || "").trim();
   const lastName = (params?.lastName || "").trim();
-  const dateOfBirth = (params?.dateOfBirth || "").trim(); // YYYY-MM-DD recommended
+  const dateOfBirth = (params?.dateOfBirth || "").trim(); // YYYY-MM-DD
 
-  // Strategy:
-  // - Pull patient list from OD and filter locally (works with your current /patients list setup).
-  // - Later you can optimize by using OD search endpoints/params if desired.
+  const hasInput = Boolean(phone || firstName || lastName || dateOfBirth);
+  if (!hasInput) {
+    return { matches: [] };
+  }
+
   const patients = await odGet("/patients");
-
-  // Defensive: ensure array
   const list = Array.isArray(patients) ? patients : [];
 
   const matches = list.filter((p) => {
-    const pPhone = digitsOnly(p.WirelessPhone || p.HmPhone || p.WkPhone || "");
-    const phoneOk = phone ? pPhone.includes(phone) : true;
+    const pPhones = digitsOnly(
+      (p.WirelessPhone || "") + (p.HmPhone || "") + (p.WkPhone || "")
+    );
 
-    const fnOk = firstName ? String(p.FName || "").toLowerCase().includes(firstName.toLowerCase()) : true;
-    const lnOk = lastName ? String(p.LName || "").toLowerCase().includes(lastName.toLowerCase()) : true;
-
-    // Your OD sample returns Birthdate like "1980-06-05" already
-    const dobOk = dateOfBirth ? String(p.Birthdate || "").startsWith(dateOfBirth) : true;
-
-    // Require at least one meaningful input
-    const hasInput = Boolean(phone || firstName || lastName || dateOfBirth);
-    if (!hasInput) return false;
+    const phoneOk = phone ? pPhones.includes(phone) : true;
+    const fnOk = firstName
+      ? String(p.FName || "").toLowerCase().includes(firstName.toLowerCase())
+      : true;
+    const lnOk = lastName
+      ? String(p.LName || "").toLowerCase().includes(lastName.toLowerCase())
+      : true;
+    const dobOk = dateOfBirth
+      ? String(p.Birthdate || "").startsWith(dateOfBirth)
+      : true;
 
     return phoneOk && fnOk && lnOk && dobOk;
   });
 
-  // Return minimal PHI-safe payload
+  // Return minimal PHI-safe payload (cap results)
   const cleaned = matches.slice(0, 10).map((p) => ({
     patNum: p.PatNum,
     firstName: p.FName || "",
@@ -164,18 +162,45 @@ async function tool_findPatient(params) {
   return { matches: cleaned };
 }
 
+// TOOL 2 (we are implementing now): Get upcoming appointments
 async function tool_getUpcomingAppointments(params) {
-  // TODO: implement with your Open Dental appointments endpoint
-  // inputs: patNum, dateFrom, dateTo
-  return {
-    ok: false,
-    error: "opendental_getUpcomingAppointments not implemented yet",
-    received: params,
-  };
+  const patNum = Number(params?.patNum);
+  if (!patNum) throw new Error("patNum is required");
+
+  const dateFrom = (params?.dateFrom || "").trim(); // YYYY-MM-DD (optional)
+  const dateTo = (params?.dateTo || "").trim(); // YYYY-MM-DD (optional)
+
+  // NOTE:
+  // The exact Open Dental appointments query endpoint can vary by implementation.
+  // Start with this common pattern. If your OD API uses different query params,
+  // we will adjust ONLY this one `path` string based on the error you paste back.
+  let path = `/appointments?patNum=${encodeURIComponent(String(patNum))}`;
+  if (dateFrom) path += `&dateFrom=${encodeURIComponent(dateFrom)}`;
+  if (dateTo) path += `&dateTo=${encodeURIComponent(dateTo)}`;
+
+  const data = await odGet(path);
+  const list = Array.isArray(data) ? data : [];
+
+  // Normalize output shape expected by Vapi tool usage
+  const appointments = list
+    .map((a) => ({
+      aptNum: a.AptNum ?? a.aptNum ?? null,
+      startDateTime: a.AptDateTime ?? a.startDateTime ?? null,
+      endDateTime: a.AptDateTimeEnd ?? a.endDateTime ?? null,
+      providerId: a.ProvNum ?? a.providerId ?? null,
+      locationId: a.ClinicNum ?? a.locationId ?? null,
+      opNum: a.Op ?? a.opNum ?? null,
+      status: a.AptStatus ?? a.status ?? null,
+      appointmentType: a.ProcDescript ?? a.appointmentType ?? null,
+      reasonForVisit: a.Note ?? a.reasonForVisit ?? null,
+    }))
+    .filter((x) => x.aptNum && x.startDateTime);
+
+  return { appointments };
 }
 
+// TOOL 3–6: stubs (we’ll implement one-by-one later)
 async function tool_getAvailability(params) {
-  // TODO: implement availability logic (schedule + operatories + appointment type)
   return {
     ok: false,
     error: "opendental_getAvailability not implemented yet",
@@ -184,7 +209,6 @@ async function tool_getAvailability(params) {
 }
 
 async function tool_bookAppointment(params) {
-  // TODO: implement booking via Open Dental appointments create/schedule endpoint
   return {
     ok: false,
     error: "opendental_bookAppointment not implemented yet",
@@ -193,7 +217,6 @@ async function tool_bookAppointment(params) {
 }
 
 async function tool_rescheduleAppointment(params) {
-  // TODO: implement reschedule via Open Dental appointments update endpoint
   return {
     ok: false,
     error: "opendental_rescheduleAppointment not implemented yet",
@@ -202,7 +225,6 @@ async function tool_rescheduleAppointment(params) {
 }
 
 async function tool_breakAppointment(params) {
-  // TODO: implement break/cancel via Open Dental appointments break endpoint
   return {
     ok: false,
     error: "opendental_breakAppointment not implemented yet",
@@ -228,9 +250,6 @@ async function runTool(toolName, params) {
     case "opendental_rescheduleAppointment":
       return await tool_rescheduleAppointment(params);
 
-    case "opendental_rescheduleAppointment":
-      return await tool_rescheduleAppointment(params);
-
     case "opendental_breakAppointment":
       return await tool_breakAppointment(params);
 
@@ -242,13 +261,6 @@ async function runTool(toolName, params) {
 // ===============================
 // Vapi webhook/tool handler
 // ===============================
-//
-// Vapi will POST a payload that includes tool calls.
-// Your existing code was mapping toolCallList -> results.
-// We'll support both shapes:
-// - req.body.toolCallList
-// - req.body.toolCalls
-//
 app.post("/vapi", async (req, res) => {
   if (!requireBearer(req, res)) return;
 
@@ -293,5 +305,4 @@ app.post("/vapi", async (req, res) => {
 // ===============================
 // Start server
 // ===============================
-
 app.listen(PORT, () => console.log("Server listening on port", PORT));
