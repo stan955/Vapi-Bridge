@@ -52,6 +52,19 @@ app.post("/vapi", (req, res) => {
   }
 });
 
+// DEBUG: list all routes currently registered (helps verify production deploy)
+app.get("/routes", (req, res) => {
+  const routes = [];
+  app._router?.stack?.forEach((layer) => {
+    if (layer.route && layer.route.path) {
+      const methods = Object.keys(layer.route.methods).map((m) => m.toUpperCase());
+      routes.push(`${methods.join(",")} ${layer.route.path}`);
+    }
+  });
+  res.json({ routes });
+});
+
+
 // Render provides PORT
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server listening on port", PORT));
