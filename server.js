@@ -2,14 +2,11 @@ import express from "express";
 import cors from "cors";
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "od-tool1-2";
+const VERSION = "od-tool1-2-odtry";
 
-// Optional: require Bearer token if set
 const BRIDGE_BEARER_TOKEN = (process.env.BRIDGE_BEARER_TOKEN || "").trim();
-
-// Open Dental API config
-const OD_BASE_URL = (process.env.OD_BASE_URL || "").trim(); // https://api.opendental.com/api/v1
-const OD_AUTH_HEADER = (process.env.OD_AUTH_HEADER || "").trim(); // ODFHIR key1/key2
+const OD_BASE_URL = (process.env.OD_BASE_URL || "").trim();
+const OD_AUTH_HEADER = (process.env.OD_AUTH_HEADER || "").trim();
 
 const app = express();
 app.use(cors());
@@ -29,7 +26,7 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/routes", (req, res) => {
-  res.json({ routes: ["GET /", "GET /health", "GET /routes", "POST /vapi"] });
+  res.json({ routes: ["GET /", "GET /health", "GET /routes", "GET /od/try?path=/...", "POST /vapi"] });
 });
 
 function unauthorized(res) {
@@ -67,11 +64,9 @@ function digitsOnly(s) {
   return String(s || "").replace(/\D/g, "");
 }
 
-// "1979-06-23", "06/23/1979", "June 23 1979", "Jun 23, 1979" -> "1979-06-23"
 function normalizeDob(input) {
   const s0 = String(input || "").trim();
   if (!s0) return "";
-
   if (/^\d{4}-\d{2}-\d{2}$/.test(s0)) return s0;
 
   const m1 = s0.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
@@ -132,11 +127,22 @@ async function odGet(path) {
   });
 }
 
-function toIsoDateTimeZ(dateObj) {
-  // Produce UTC ISO string without milliseconds
-  const iso = dateObj.toISOString();
-  return iso.replace(/\.\d{3}Z$/, "Z");
-}
+// 🔎 Debug endpoint: lets us probe OD endpoints without editing code
+app.get("/od/try", async (req, res) => {
+  // optional protection: require bearer if you set one
+  if (!requireBearer(req, res)) return;
+
+  try {
+    const path = String(req.query.path || "").trim();
+    if (!path || !path.startsWith("/")) {
+      return res.status(400).json({ ok: false, error: "Provide ?path=/something" });
+    }
+    const data = await odGet(path);
+    res.json({ ok: true, path, data });
+  } catch (err) {
+    res.status(200).json({ ok: false, error: String(err?.message || err) });
+  }
+});
 
 async function tool_findPatient(params) {
   const phone = digitsOnly(params?.phone);
@@ -155,7 +161,7 @@ async function tool_findPatient(params) {
     const fnOk = firstName ? String(p.FName || "").toLowerCase().includes(firstName.toLowerCase()) : true;
     const lnOk = lastName ? String(p.LName || "").toLowerCase().includes(lastName.toLowerCase()) : true;
     const dobOk = dobIso ? String(p.Birthdate || "").startsWith(dobIso) : true;
-    return phoneOk && fnOk && lnOk && dobOk;
+    return phoneOk && fnOk && lnOk && lnOk && dobOk;
   });
 
   return {
@@ -176,47 +182,35 @@ async function tool_getUpcomingAppointments(params) {
   const patNum = Number(params?.patNum);
   if (!patNum) throw new Error("patNum is required");
 
-  // We only want "upcoming": future-only + Scheduled/Planned
-  // To keep it robust across OD environments, we fetch by patient then filter here.
   const data = await odGet(`/appointments?patNum=${encodeURIComponent(String(patNum))}`);
   const list = Array.isArray(data) ? data : [];
 
   const now = new Date();
 
-  const normalized = list.map((a) => {
-    const start = a.AptDateTime ?? a.startDateTime ?? null;
-    const end = a.AptDateTimeEnd ?? a.endDateTime ?? null;
-    const status = a.AptStatus ?? a.status ?? null;
+  const normalized = list.map((a) => ({
+    aptNum: a.AptNum ?? a.aptNum ?? null,
+    startDateTime: a.AptDateTime ?? a.startDateTime ?? null,
+    endDateTime: a.AptDateTimeEnd ?? a.endDateTime ?? null,
+    providerId: a.ProvNum ?? a.providerId ?? null,
+    locationId: a.ClinicNum ?? a.locationId ?? null,
+    opNum: a.Op ?? a.opNum ?? null,
+    status: a.AptStatus ?? a.status ?? null,
+    appointmentType: a.ProcDescript ?? a.appointmentType ?? null,
+    reasonForVisit: a.Note ?? a.reasonForVisit ?? null,
+  }));
 
-    return {
-      aptNum: a.AptNum ?? a.aptNum ?? null,
-      startDateTime: start,
-      endDateTime: end,
-      providerId: a.ProvNum ?? a.providerId ?? null,
-      locationId: a.ClinicNum ?? a.locationId ?? null,
-      opNum: a.Op ?? a.opNum ?? null,
-      status,
-      appointmentType: a.ProcDescript ?? a.appointmentType ?? null,
-      reasonForVisit: a.Note ?? a.reasonForVisit ?? null,
-    };
-  });
+  const upcoming = normalized
+    .filter((apt) => {
+      const statusOk = apt.status === "Scheduled" || apt.status === "Planned";
+      if (!statusOk) return false;
 
-  const upcoming = normalized.filter((apt) => {
-    const statusOk = apt.status === "Scheduled" || apt.status === "Planned";
-    if (!statusOk) return false;
+      if (!apt.startDateTime) return false;
+      const dt = new Date(apt.startDateTime);
+      if (isNaN(dt.getTime())) return false;
 
-    if (!apt.startDateTime) return false;
-    const dt = new Date(apt.startDateTime);
-    if (isNaN(dt.getTime())) return false;
-
-    return dt.getTime() >= now.getTime();
-  });
-
-  upcoming.sort((a, b) => {
-    const ta = new Date(a.startDateTime).getTime();
-    const tb = new Date(b.startDateTime).getTime();
-    return ta - tb;
-  });
+      return dt.getTime() >= now.getTime();
+    })
+    .sort((a, b) => new Date(a.startDateTime).getTime() - new Date(b.startDateTime).getTime());
 
   return { appointments: upcoming };
 }
@@ -225,10 +219,8 @@ async function runTool(name, parameters) {
   switch (name) {
     case "opendental_findPatient":
       return await tool_findPatient(parameters);
-
     case "opendental_getUpcomingAppointments":
       return await tool_getUpcomingAppointments(parameters);
-
     default:
       return { ok: false, error: `Unknown tool: ${name}` };
   }
