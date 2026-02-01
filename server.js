@@ -2,11 +2,15 @@ import express from "express";
 import cors from "cors";
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "od-tool1-2-3-computed-v2";
+const VERSION = "reset-clean-availability-book-resched-break-v1";
 
+// Optional: protect /vapi + /od/try with a bearer token
+// If empty, no auth is required.
 const BRIDGE_BEARER_TOKEN = (process.env.BRIDGE_BEARER_TOKEN || "").trim();
-const OD_BASE_URL = (process.env.OD_BASE_URL || "").trim(); // https://api.opendental.com/api/v1
-const OD_AUTH_HEADER = (process.env.OD_AUTH_HEADER || "").trim(); // ODFHIR key1/key2
+
+// Open Dental API settings (Render Environment Variables)
+const OD_BASE_URL = (process.env.OD_BASE_URL || "").trim(); // e.g. https://api.opendental.com/api/v1
+const OD_AUTH_HEADER = (process.env.OD_AUTH_HEADER || "").trim(); // e.g. ODFHIR key1/key2
 
 const app = express();
 app.use(cors());
@@ -14,33 +18,28 @@ app.use(express.json({ limit: "2mb" }));
 
 app.get("/", (req, res) => res.status(200).send(`alive-${VERSION}`));
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    version: VERSION,
-    node: process.version,
-    hasBearer: Boolean(BRIDGE_BEARER_TOKEN),
-    hasOdBaseUrl: Boolean(OD_BASE_URL),
-    hasOdAuthHeader: Boolean(OD_AUTH_HEADER),
-  });
-});
-
 app.get("/routes", (req, res) => {
   res.json({
-    routes: ["GET /", "GET /health", "GET /routes", "GET /od/try?path=/...", "POST /vapi"],
+    routes: ["GET /", "GET /routes", "GET /od/try?path=/...", "POST /vapi"],
+    toolNamesSupported: [
+      "opendental_findPatient",
+      "Open_Dental_findPatient (alias)",
+      "open_dental_findPatient (alias)",
+      "opendental_getUpcomingAppointments",
+      "opendental_getAvailability",
+      "opendental_bookAppointment",
+      "opendental_rescheduleAppointment",
+      "opendental_breakAppointment",
+    ],
   });
 });
 
-function unauthorized(res) {
-  return res.status(401).json({ ok: false, error: "Unauthorized" });
-}
-
 function requireBearer(req, res) {
-  if (!BRIDGE_BEARER_TOKEN) return true;
+  if (!BRIDGE_BEARER_TOKEN) return true; // no auth required
   const auth = (req.headers.authorization || "").trim();
   const expected = `Bearer ${BRIDGE_BEARER_TOKEN}`;
   if (auth !== expected) {
-    unauthorized(res);
+    res.status(401).json({ ok: false, error: "Unauthorized" });
     return false;
   }
   return true;
@@ -62,13 +61,37 @@ async function httpJson(url, options = {}) {
   return data;
 }
 
-async function odGet(path) {
+function mustHaveOdConfig() {
   if (!OD_BASE_URL) throw new Error("Missing OD_BASE_URL.");
   if (!OD_AUTH_HEADER) throw new Error("Missing OD_AUTH_HEADER.");
+}
+
+async function odGet(path) {
+  mustHaveOdConfig();
   const url = `${OD_BASE_URL}${path}`;
   return httpJson(url, {
     method: "GET",
     headers: { Authorization: OD_AUTH_HEADER, "Content-Type": "application/json" },
+  });
+}
+
+async function odPost(path, bodyObj) {
+  mustHaveOdConfig();
+  const url = `${OD_BASE_URL}${path}`;
+  return httpJson(url, {
+    method: "POST",
+    headers: { Authorization: OD_AUTH_HEADER, "Content-Type": "application/json" },
+    body: JSON.stringify(bodyObj || {}),
+  });
+}
+
+async function odPut(path, bodyObj) {
+  mustHaveOdConfig();
+  const url = `${OD_BASE_URL}${path}`;
+  return httpJson(url, {
+    method: "PUT",
+    headers: { Authorization: OD_AUTH_HEADER, "Content-Type": "application/json" },
+    body: JSON.stringify(bodyObj || {}),
   });
 }
 
@@ -81,85 +104,16 @@ async function odGetMaybe(path) {
   }
 }
 
-// Debug helper
-app.get("/od/try", async (req, res) => {
-  if (!requireBearer(req, res)) return;
-  try {
-    const path = String(req.query.path || "").trim();
-    if (!path || !path.startsWith("/")) {
-      return res.status(400).json({ ok: false, error: "Provide ?path=/something" });
-    }
-    const data = await odGet(path);
-    res.json({ ok: true, path, data });
-  } catch (err) {
-    res.status(200).json({ ok: false, error: String(err?.message || err) });
-  }
-});
-
 function digitsOnly(s) {
   return String(s || "").replace(/\D/g, "");
-}
-
-function normalizeDob(input) {
-  const s0 = String(input || "").trim();
-  if (!s0) return "";
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s0)) return s0;
-
-  const m1 = s0.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-  if (m1) {
-    const mm = String(m1[1]).padStart(2, "0");
-    const dd = String(m1[2]).padStart(2, "0");
-    const yyyy = m1[3];
-    return `${yyyy}-${mm}-${dd}`;
-  }
-
-  const monthMap = {
-    jan: "01", january: "01",
-    feb: "02", february: "02",
-    mar: "03", march: "03",
-    apr: "04", april: "04",
-    may: "05",
-    jun: "06", june: "06",
-    jul: "07", july: "07",
-    aug: "08", august: "08",
-    sep: "09", sept: "09", september: "09",
-    oct: "10", october: "10",
-    nov: "11", november: "11",
-    dec: "12", december: "12",
-  };
-
-  const cleaned = s0.toLowerCase().replace(/,/g, " ").replace(/\s+/g, " ").trim();
-  const parts = cleaned.split(" ");
-  if (parts.length >= 3) {
-    const month = monthMap[parts[0]];
-    const day = parts[1]?.replace(/\D/g, "");
-    const year = parts[2]?.replace(/\D/g, "");
-    if (month && day && year && year.length === 4) {
-      return `${year}-${month}-${String(day).padStart(2, "0")}`;
-    }
-  }
-
-  const d = new Date(s0);
-  if (!isNaN(d.getTime())) {
-    const yyyy = d.getFullYear();
-    const mm = String(d.getMonth() + 1).padStart(2, "0");
-    const dd = String(d.getDate()).padStart(2, "0");
-    return `${yyyy}-${mm}-${dd}`;
-  }
-  return "";
 }
 
 function normalizeDateOnly(input) {
   const s = String(input || "").trim();
   if (!s) return "";
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-  const m1 = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-  if (m1) {
-    const mm = String(m1[1]).padStart(2, "0");
-    const dd = String(m1[2]).padStart(2, "0");
-    const yyyy = m1[3];
-    return `${yyyy}-${mm}-${dd}`;
-  }
+
+  // Try Date parsing (handles "June 23 1979", etc.)
   const d = new Date(s);
   if (!isNaN(d.getTime())) {
     const yyyy = d.getFullYear();
@@ -170,13 +124,10 @@ function normalizeDateOnly(input) {
   return "";
 }
 
-// Parse "YYYY-MM-DD HH:MM:SS" or ISO-ish
 function parseOdDateTime(s) {
   if (!s) return null;
   const str = String(s).trim();
   if (!str) return null;
-
-  // Convert "2026-02-09 10:00:00" -> "2026-02-09T10:00:00"
   const isoish = str.includes(" ") && !str.includes("T") ? str.replace(" ", "T") : str;
   const d = new Date(isoish);
   if (isNaN(d.getTime())) return null;
@@ -211,36 +162,26 @@ function clampInt(n, def, min, max) {
 function unwrapArray(maybe) {
   if (Array.isArray(maybe)) return maybe;
   if (!maybe || typeof maybe !== "object") return null;
-
-  const keys = ["data", "items", "results", "schedules", "appointments", "slots", "Slots"];
+  const keys = ["data", "items", "results", "schedules", "appointments", "slots"];
   for (const k of keys) {
     if (Array.isArray(maybe[k])) return maybe[k];
   }
-
   for (const v of Object.values(maybe)) {
     if (Array.isArray(v)) return v;
   }
-
   return null;
 }
 
-// ✅ Key fix: build a DateTime from either:
-// - full datetime string
-// - OR date field + time-only string ("08:00:00")
 function parseScheduleDateTime(obj, timeValue, preferredDate) {
   if (!timeValue) return null;
-
   const raw = String(timeValue).trim();
 
-  // If it's already a full datetime, parse normally
   const dt = parseOdDateTime(raw);
   if (dt) return dt;
 
-  // If it's time-only like "08:00:00" or "08:00"
   const isTimeOnly = /^\d{1,2}:\d{2}(:\d{2})?$/.test(raw);
   if (!isTimeOnly) return null;
 
-  // Find schedule date in obj if preferredDate not provided
   const dateCandidates = [
     preferredDate,
     obj.SchedDate,
@@ -254,20 +195,34 @@ function parseScheduleDateTime(obj, timeValue, preferredDate) {
   const dateStr = normalizeDateOnly(dateCandidates[0] || "");
   if (!dateStr) return null;
 
-  // Combine: YYYY-MM-DD + T + HH:MM:SS
-  const hhmmss = raw.length === 5 ? `${raw}:00` : raw; // "08:00" -> "08:00:00"
+  const hhmmss = raw.length === 5 ? `${raw}:00` : raw;
   return new Date(`${dateStr}T${hhmmss}`);
 }
 
-// -------------------- TOOLS --------------------
+// -------------------- DEBUG: hit any OD endpoint safely --------------------
+app.get("/od/try", async (req, res) => {
+  if (!requireBearer(req, res)) return;
 
+  try {
+    const path = String(req.query.path || "").trim();
+    if (!path || !path.startsWith("/")) {
+      return res.status(400).json({ ok: false, error: "Provide ?path=/something" });
+    }
+    const data = await odGet(path);
+    res.json({ ok: true, path, data });
+  } catch (err) {
+    res.status(200).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// -------------------- TOOL: Find Patient --------------------
 async function tool_findPatient(params) {
-  const phone = digitsOnly(params?.phone);
-  const firstName = (params?.firstName || "").trim();
-  const lastName = (params?.lastName || "").trim();
-  const dobIso = normalizeDob((params?.dateOfBirth || "").trim());
+  const phone = digitsOnly(params?.phone || params?.mobilePhone || params?.wirelessPhone);
+  const firstName = String(params?.firstName || "").trim();
+  const lastName = String(params?.lastName || "").trim();
+  const dob = normalizeDateOnly(params?.dateOfBirth || params?.dob || "");
 
-  if (!phone && !firstName && !lastName && !dobIso) return { matches: [] };
+  if (!phone && !firstName && !lastName && !dob) return { matches: [] };
 
   const patients = await odGet("/patients");
   const list = Array.isArray(patients) ? patients : [];
@@ -277,7 +232,7 @@ async function tool_findPatient(params) {
     const phoneOk = phone ? pPhones.includes(phone) : true;
     const fnOk = firstName ? String(p.FName || "").toLowerCase().includes(firstName.toLowerCase()) : true;
     const lnOk = lastName ? String(p.LName || "").toLowerCase().includes(lastName.toLowerCase()) : true;
-    const dobOk = dobIso ? String(p.Birthdate || "").startsWith(dobIso) : true;
+    const dobOk = dob ? String(p.Birthdate || "").includes(dob) : true;
     return phoneOk && fnOk && lnOk && dobOk;
   });
 
@@ -295,6 +250,7 @@ async function tool_findPatient(params) {
   };
 }
 
+// -------------------- TOOL: Upcoming Appointments --------------------
 async function tool_getUpcomingAppointments(params) {
   const patNum = Number(params?.patNum);
   if (!patNum) throw new Error("patNum is required");
@@ -305,15 +261,15 @@ async function tool_getUpcomingAppointments(params) {
   const now = new Date();
 
   const normalized = list.map((a) => ({
-    aptNum: a.AptNum ?? a.aptNum ?? null,
-    startDateTime: a.AptDateTime ?? a.startDateTime ?? null,
-    endDateTime: a.AptDateTimeEnd ?? a.endDateTime ?? null,
-    providerId: a.ProvNum ?? a.providerId ?? null,
-    locationId: a.ClinicNum ?? a.locationId ?? null,
-    opNum: a.Op ?? a.opNum ?? null,
-    status: a.AptStatus ?? a.status ?? null,
-    appointmentType: a.ProcDescript ?? a.appointmentType ?? null,
-    reasonForVisit: a.Note ?? a.reasonForVisit ?? null,
+    aptNum: a.AptNum ?? null,
+    startDateTime: a.AptDateTime ?? null,
+    endDateTime: a.AptDateTimeEnd ?? null,
+    providerId: a.ProvNum ?? null,
+    locationId: a.ClinicNum ?? null,
+    opNum: a.Op ?? null,
+    status: a.AptStatus ?? null,
+    appointmentType: a.ProcDescript ?? null,
+    reasonForVisit: a.Note ?? null,
   }));
 
   const upcoming = normalized
@@ -329,7 +285,8 @@ async function tool_getUpcomingAppointments(params) {
   return { appointments: upcoming };
 }
 
-async function tool_getAvailableSlots(params) {
+// -------------------- TOOL: Availability (computed) --------------------
+async function tool_getAvailability(params) {
   const today = new Date();
   const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
 
@@ -354,65 +311,23 @@ async function tool_getAvailableSlots(params) {
       ? Number(params.opNum)
       : null;
 
-  // --- schedules ---
-  const scheduleCandidates = [
-    `/schedules?dateStart=${encodeURIComponent(startDate)}&dateEnd=${encodeURIComponent(endDate)}`,
-    `/schedules`,
-  ];
+  const schResp = await odGetMaybe(
+    `/schedules?dateStart=${encodeURIComponent(startDate)}&dateEnd=${encodeURIComponent(endDate)}`
+  );
+  if (!schResp.ok) return { ok: false, error: schResp.error };
 
-  let schedules = null;
-  let scheduleSource = null;
-  let scheduleError = null;
+  const schedules = unwrapArray(schResp.data) || [];
 
-  for (const path of scheduleCandidates) {
-    const r = await odGetMaybe(path);
-    if (!r.ok) {
-      scheduleError = r.error;
-      continue;
-    }
-    const list = unwrapArray(r.data);
-    if (Array.isArray(list)) {
-      schedules = list;
-      scheduleSource = path;
-      break;
-    }
-  }
+  const apResp = await odGetMaybe(
+    `/appointments?dateStart=${encodeURIComponent(startDate)}&dateEnd=${encodeURIComponent(endDate)}`
+  );
+  const appts = apResp.ok ? (unwrapArray(apResp.data) || []) : [];
 
-  if (!Array.isArray(schedules)) {
-    return { ok: false, error: "Could not fetch schedules from Open Dental.", scheduleSource, scheduleError };
-  }
-
-  // --- appointments in range ---
-  const apptCandidates = [
-    `/appointments?dateStart=${encodeURIComponent(startDate)}&dateEnd=${encodeURIComponent(endDate)}`,
-    `/appointments`,
-  ];
-
-  let appts = [];
-  let apptSource = null;
-  let apptError = null;
-
-  for (const path of apptCandidates) {
-    const r = await odGetMaybe(path);
-    if (!r.ok) {
-      apptError = r.error;
-      continue;
-    }
-    const list = unwrapArray(r.data);
-    if (Array.isArray(list)) {
-      appts = list;
-      apptSource = path;
-      break;
-    }
-  }
-
-  // Normalize schedule blocks (date+time support)
   const blocks = schedules
     .map((s) => {
       const schedDate = normalizeDateOnly(
         s.SchedDate ?? s.schedDate ?? s.Date ?? s.date ?? s.ScheduleDate ?? s.scheduleDate ?? ""
       );
-
       const startRaw = s.StartTime ?? s.DateTimeStart ?? s.StartDateTime ?? s.startTime ?? s.dateTimeStart ?? null;
       const stopRaw = s.StopTime ?? s.DateTimeStop ?? s.EndDateTime ?? s.stopTime ?? s.dateTimeStop ?? null;
 
@@ -425,56 +340,39 @@ async function tool_getAvailableSlots(params) {
         providerId: s.ProvNum ?? s.provNum ?? s.providerId ?? null,
         locationId: s.ClinicNum ?? s.clinicNum ?? s.locationId ?? null,
         opNum: s.Op ?? s.OpNum ?? s.opNum ?? null,
-        schedType: s.SchedType ?? s.schedType ?? null,
       };
     })
-    .filter((b) => b.start && b.end && b.end > b.start);
+    .filter((b) => b.start && b.end && b.end > b.start)
+    .filter((b) => {
+      if (locationId !== null && b.locationId !== null && Number(b.locationId) !== Number(locationId)) return false;
+      if (providerId && b.providerId && Number(b.providerId) !== Number(providerId)) return false;
+      if (opNum && b.opNum && Number(b.opNum) !== Number(opNum)) return false;
+      return true;
+    });
 
-  const filteredBlocks = blocks.filter((b) => {
-    if (locationId !== null && b.locationId !== null && Number(b.locationId) !== Number(locationId)) return false;
-    if (providerId && b.providerId && Number(b.providerId) !== Number(providerId)) return false;
-    if (opNum && b.opNum && Number(b.opNum) !== Number(opNum)) return false;
-    return true;
-  });
-
-  // Busy appt blocks
   const busyAll = appts
     .map((a) => {
-      const start = a.AptDateTime ?? a.startDateTime ?? null;
-      const end = a.AptDateTimeEnd ?? a.endDateTime ?? null;
-      const status = a.AptStatus ?? a.status ?? null;
-
-      const sd = parseOdDateTime(start);
+      const sd = parseOdDateTime(a.AptDateTime ?? null);
       if (!sd) return null;
-
-      const ed = parseOdDateTime(end) || new Date(sd.getTime() + durationMinutes * 60000);
-
+      const ed = parseOdDateTime(a.AptDateTimeEnd ?? null) || new Date(sd.getTime() + durationMinutes * 60000);
       return {
         start: sd,
         end: ed,
-        providerId: a.ProvNum ?? a.providerId ?? null,
-        locationId: a.ClinicNum ?? a.locationId ?? null,
-        opNum: a.Op ?? a.opNum ?? null,
-        status,
+        providerId: a.ProvNum ?? null,
+        locationId: a.ClinicNum ?? null,
+        opNum: a.Op ?? null,
+        status: a.AptStatus ?? null,
       };
     })
-    .filter(Boolean);
-
-  const isBlockingStatus = (st) => {
-    const s = String(st || "").toLowerCase();
-    if (!s) return true;
-    if (s.includes("cancel")) return false;
-    if (s.includes("broken")) return false;
-    return true;
-  };
-
-  const busy = busyAll.filter((b) => {
-    if (!isBlockingStatus(b.status)) return false;
-    if (locationId !== null && b.locationId !== null && Number(b.locationId) !== Number(locationId)) return false;
-    if (providerId && b.providerId && Number(b.providerId) !== Number(providerId)) return false;
-    if (opNum && b.opNum && Number(b.opNum) !== Number(opNum)) return false;
-    return true;
-  });
+    .filter(Boolean)
+    .filter((b) => {
+      const s = String(b.status || "").toLowerCase();
+      if (s.includes("cancel") || s.includes("broken")) return false;
+      if (locationId !== null && b.locationId !== null && Number(b.locationId) !== Number(locationId)) return false;
+      if (providerId && b.providerId && Number(b.providerId) !== Number(providerId)) return false;
+      if (opNum && b.opNum && Number(b.opNum) !== Number(opNum)) return false;
+      return true;
+    });
 
   function subtractIntervals(freeIntervals, busyInterval) {
     const out = [];
@@ -484,24 +382,21 @@ async function tool_getAvailableSlots(params) {
         continue;
       }
       if (busyInterval.start <= f.start && busyInterval.end >= f.end) continue;
-
-      if (busyInterval.start > f.start) {
+      if (busyInterval.start > f.start)
         out.push({ start: f.start, end: new Date(Math.min(busyInterval.start.getTime(), f.end.getTime())) });
-      }
-      if (busyInterval.end < f.end) {
+      if (busyInterval.end < f.end)
         out.push({ start: new Date(Math.max(busyInterval.end.getTime(), f.start.getTime())), end: f.end });
-      }
     }
     return out.filter((x) => x.end > x.start);
   }
 
   const slots = [];
-  const maxSlots = 60;
+  const maxSlots = 80;
 
-  for (const block of filteredBlocks) {
+  for (const block of blocks) {
     let free = [{ start: block.start, end: block.end }];
 
-    for (const b of busy) {
+    for (const b of busyAll) {
       if (b.end <= block.start || b.start >= block.end) continue;
       free = subtractIntervals(free, b);
       if (!free.length) break;
@@ -509,7 +404,6 @@ async function tool_getAvailableSlots(params) {
 
     for (const f of free) {
       let cursor = new Date(f.start.getTime());
-
       const m = cursor.getMinutes();
       const aligned = Math.ceil(m / incrementMinutes) * incrementMinutes;
       cursor.setMinutes(aligned, 0, 0);
@@ -526,40 +420,180 @@ async function tool_getAvailableSlots(params) {
         if (slots.length >= maxSlots) break;
         cursor = new Date(cursor.getTime() + incrementMinutes * 60000);
       }
-
       if (slots.length >= maxSlots) break;
     }
-
     if (slots.length >= maxSlots) break;
   }
 
   return {
     slots,
     source: "computed",
-    scheduleSource,
-    apptSource,
-    apptError,
-    debug: {
-      scheduleBlocks: blocks.length,
-      filteredBlocks: filteredBlocks.length,
-      busyBlocks: busy.length,
-    },
+    scheduleSource: `/schedules?dateStart=${startDate}&dateEnd=${endDate}`,
+    apptSource: `/appointments?dateStart=${startDate}&dateEnd=${endDate}`,
   };
 }
 
+// -------------------- TOOL: Book Appointment --------------------
+// NOTE: OD API implementations can vary. We try common patterns safely.
+async function tool_bookAppointment(params) {
+  const patNum = Number(params?.patNum);
+  const startDateTime = String(params?.startDateTime || "").trim();
+  const durationMinutes = clampInt(params?.durationMinutes, 60, 10, 240);
+  const providerId = Number(params?.providerId);
+  const locationId = params?.locationId !== undefined ? Number(params?.locationId) : 0;
+  const opNum = Number(params?.opNum);
+
+  const appointmentType = String(params?.appointmentType || "").trim();
+  const reasonForVisit = String(params?.reasonForVisit || "").trim();
+  const notes = String(params?.notes || "").trim();
+
+  if (!patNum || !startDateTime || !providerId || !opNum) {
+    return { ok: false, error: "patNum, startDateTime, providerId, and opNum are required." };
+  }
+
+  const sd = parseOdDateTime(startDateTime);
+  if (!sd) return { ok: false, error: "startDateTime must be parseable (prefer: YYYY-MM-DD HH:MM:SS)." };
+  const ed = new Date(sd.getTime() + durationMinutes * 60000);
+
+  // Most common OD-style fields
+  const payload = {
+    PatNum: patNum,
+    AptDateTime: formatOdDateTime(sd),
+    AptDateTimeEnd: formatOdDateTime(ed),
+    ProvNum: providerId,
+    ClinicNum: locationId,
+    Op: opNum,
+    AptStatus: "Scheduled",
+    ProcDescript: appointmentType || undefined,
+    Note: [reasonForVisit, notes].filter(Boolean).join(" | ") || undefined,
+  };
+
+  const candidates = ["/appointments", "/appointment"];
+  let lastErr = null;
+
+  for (const path of candidates) {
+    try {
+      const created = await odPost(path, payload);
+      const aptNum = created?.AptNum ?? created?.aptNum ?? created?.id ?? null;
+      return {
+        ok: true,
+        aptNum,
+        confirmation: {
+          patNum,
+          startDateTime: payload.AptDateTime,
+          endDateTime: payload.AptDateTimeEnd,
+          providerId,
+          locationId,
+          opNum,
+        },
+        created,
+      };
+    } catch (e) {
+      lastErr = String(e?.message || e);
+    }
+  }
+
+  return { ok: false, error: lastErr || "Unable to create appointment." };
+}
+
+// -------------------- TOOL: Reschedule Appointment --------------------
+async function tool_rescheduleAppointment(params) {
+  const aptNum = Number(params?.aptNum);
+  const startDateTime = String(params?.startDateTime || "").trim();
+  const durationMinutes = clampInt(params?.durationMinutes, 60, 10, 240);
+
+  if (!aptNum || !startDateTime) {
+    return { ok: false, error: "aptNum and startDateTime are required." };
+  }
+
+  const sd = parseOdDateTime(startDateTime);
+  if (!sd) return { ok: false, error: "startDateTime must be parseable (prefer: YYYY-MM-DD HH:MM:SS)." };
+  const ed = new Date(sd.getTime() + durationMinutes * 60000);
+
+  const patch = {
+    AptNum: aptNum,
+    AptDateTime: formatOdDateTime(sd),
+    AptDateTimeEnd: formatOdDateTime(ed),
+  };
+
+  // Try common patterns
+  const candidates = [`/appointments/${aptNum}`, `/appointment/${aptNum}`, `/appointments`];
+  let lastErr = null;
+
+  for (const path of candidates) {
+    try {
+      const resp =
+        path === "/appointments"
+          ? await odPut(path, patch) // some APIs update by AptNum in body
+          : await odPut(path, patch);
+
+      return { ok: true, aptNum, updated: resp, confirmation: patch };
+    } catch (e) {
+      lastErr = String(e?.message || e);
+    }
+  }
+
+  return { ok: false, error: lastErr || "Unable to reschedule appointment." };
+}
+
+// -------------------- TOOL: Break (Cancel) Appointment --------------------
+async function tool_breakAppointment(params) {
+  const aptNum = Number(params?.aptNum);
+  const reason = String(params?.reason || params?.note || "").trim();
+
+  if (!aptNum) return { ok: false, error: "aptNum is required." };
+
+  const patch = {
+    AptNum: aptNum,
+    AptStatus: "Broken", // common OD status label
+    Note: reason || undefined,
+  };
+
+  const candidates = [`/appointments/${aptNum}`, `/appointment/${aptNum}`, `/appointments`];
+  let lastErr = null;
+
+  for (const path of candidates) {
+    try {
+      const resp = await odPut(path, patch);
+      return { ok: true, aptNum, updated: resp, confirmation: patch };
+    } catch (e) {
+      lastErr = String(e?.message || e);
+    }
+  }
+
+  return { ok: false, error: lastErr || "Unable to break/cancel appointment." };
+}
+
+// -------------------- Tool Router --------------------
 async function runTool(name, parameters) {
   switch (name) {
+    // patient lookup (support a couple alias names so you don't get burned)
     case "opendental_findPatient":
+    case "Open_Dental_findPatient":
+    case "open_dental_findPatient":
       return await tool_findPatient(parameters);
+
     case "opendental_getUpcomingAppointments":
       return await tool_getUpcomingAppointments(parameters);
-    case "opendental_getAvailableSlots":
-      return await tool_getAvailableSlots(parameters);
+
+    case "opendental_getAvailability":
+      return await tool_getAvailability(parameters);
+
+    case "opendental_bookAppointment":
+      return await tool_bookAppointment(parameters);
+
+    case "opendental_rescheduleAppointment":
+      return await tool_rescheduleAppointment(parameters);
+
+    case "opendental_breakAppointment":
+      return await tool_breakAppointment(parameters);
+
     default:
       return { ok: false, error: `Unknown tool: ${name}` };
   }
 }
 
+// -------------------- Vapi endpoint --------------------
 app.post("/vapi", async (req, res) => {
   if (!requireBearer(req, res)) return;
 
