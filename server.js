@@ -3,37 +3,55 @@ import cors from "cors";
 
 const PORT = process.env.PORT || 3000;
 
+// Change this string any time you deploy so you know what's live
+const VERSION = "reset-1";
+
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-app.get("/", (req, res) => res.status(200).send("alive-minimal-green"));
+app.get("/", (req, res) => res.status(200).send(`alive-${VERSION}`));
 
 app.get("/routes", (req, res) => {
-  res.json({ routes: ["GET /", "GET /routes", "POST /vapi"] });
+  res.json({
+    routes: [
+      "GET /",
+      "GET /routes",
+      "GET /health",
+      "POST /vapi"
+    ]
+  });
 });
 
-// Minimal /vapi handler (echo back what Vapi sent)
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    version: VERSION,
+    node: process.version,
+    time: new Date().toISOString()
+  });
+});
+
+// Minimal Vapi tool handler: echoes tool calls back
 app.post("/vapi", (req, res) => {
   const toolCallList = req.body?.toolCallList || req.body?.toolCalls || [];
-  const results = (Array.isArray(toolCallList) ? toolCallList : []).map((t) => ({
+  const list = Array.isArray(toolCallList) ? toolCallList : [];
+
+  const results = list.map((t) => ({
     toolCallId: t?.id || t?.toolCallId || null,
     result: {
       ok: true,
       echoToolName: t?.name || t?.toolName || "",
-      echoParameters: t?.parameters || t?.args || {},
-    },
+      echoParameters: t?.parameters || t?.args || {}
+    }
   }));
 
   res.json({ results });
 });
 
 app.listen(PORT, () => {
-  console.log("Server listening on port", PORT);
+  console.log(`vapi-bridge listening on ${PORT} (${VERSION})`);
 });
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
   } catch {
     data = text;
   }
