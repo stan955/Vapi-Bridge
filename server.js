@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "od-tool1-1";
+const VERSION = "od-tool1-2";
 
 // Optional: require Bearer token if set
 const BRIDGE_BEARER_TOKEN = (process.env.BRIDGE_BEARER_TOKEN || "").trim();
@@ -132,6 +132,12 @@ async function odGet(path) {
   });
 }
 
+function toIsoDateTimeZ(dateObj) {
+  // Produce UTC ISO string without milliseconds
+  const iso = dateObj.toISOString();
+  return iso.replace(/\.\d{3}Z$/, "Z");
+}
+
 async function tool_findPatient(params) {
   const phone = digitsOnly(params?.phone);
   const firstName = (params?.firstName || "").trim();
@@ -166,10 +172,63 @@ async function tool_findPatient(params) {
   };
 }
 
+async function tool_getUpcomingAppointments(params) {
+  const patNum = Number(params?.patNum);
+  if (!patNum) throw new Error("patNum is required");
+
+  // We only want "upcoming": future-only + Scheduled/Planned
+  // To keep it robust across OD environments, we fetch by patient then filter here.
+  const data = await odGet(`/appointments?patNum=${encodeURIComponent(String(patNum))}`);
+  const list = Array.isArray(data) ? data : [];
+
+  const now = new Date();
+
+  const normalized = list.map((a) => {
+    const start = a.AptDateTime ?? a.startDateTime ?? null;
+    const end = a.AptDateTimeEnd ?? a.endDateTime ?? null;
+    const status = a.AptStatus ?? a.status ?? null;
+
+    return {
+      aptNum: a.AptNum ?? a.aptNum ?? null,
+      startDateTime: start,
+      endDateTime: end,
+      providerId: a.ProvNum ?? a.providerId ?? null,
+      locationId: a.ClinicNum ?? a.locationId ?? null,
+      opNum: a.Op ?? a.opNum ?? null,
+      status,
+      appointmentType: a.ProcDescript ?? a.appointmentType ?? null,
+      reasonForVisit: a.Note ?? a.reasonForVisit ?? null,
+    };
+  });
+
+  const upcoming = normalized.filter((apt) => {
+    const statusOk = apt.status === "Scheduled" || apt.status === "Planned";
+    if (!statusOk) return false;
+
+    if (!apt.startDateTime) return false;
+    const dt = new Date(apt.startDateTime);
+    if (isNaN(dt.getTime())) return false;
+
+    return dt.getTime() >= now.getTime();
+  });
+
+  upcoming.sort((a, b) => {
+    const ta = new Date(a.startDateTime).getTime();
+    const tb = new Date(b.startDateTime).getTime();
+    return ta - tb;
+  });
+
+  return { appointments: upcoming };
+}
+
 async function runTool(name, parameters) {
   switch (name) {
     case "opendental_findPatient":
       return await tool_findPatient(parameters);
+
+    case "opendental_getUpcomingAppointments":
+      return await tool_getUpcomingAppointments(parameters);
+
     default:
       return { ok: false, error: `Unknown tool: ${name}` };
   }
