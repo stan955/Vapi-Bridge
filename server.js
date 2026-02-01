@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 
 const PORT = process.env.PORT || 3000;
-const VERSION = "od-tool1-2-3-computed";
+const VERSION = "od-tool1-2-3-computed-v2";
 
 const BRIDGE_BEARER_TOKEN = (process.env.BRIDGE_BEARER_TOKEN || "").trim();
 const OD_BASE_URL = (process.env.OD_BASE_URL || "").trim(); // https://api.opendental.com/api/v1
@@ -81,7 +81,7 @@ async function odGetMaybe(path) {
   }
 }
 
-// Debug helper: probe OD endpoints without editing code
+// Debug helper
 app.get("/od/try", async (req, res) => {
   if (!requireBearer(req, res)) return;
   try {
@@ -170,11 +170,13 @@ function normalizeDateOnly(input) {
   return "";
 }
 
-// Parse "YYYY-MM-DD HH:MM:SS" or ISO-ish; treat as local time
+// Parse "YYYY-MM-DD HH:MM:SS" or ISO-ish
 function parseOdDateTime(s) {
   if (!s) return null;
   const str = String(s).trim();
   if (!str) return null;
+
+  // Convert "2026-02-09 10:00:00" -> "2026-02-09T10:00:00"
   const isoish = str.includes(" ") && !str.includes("T") ? str.replace(" ", "T") : str;
   const d = new Date(isoish);
   if (isNaN(d.getTime())) return null;
@@ -210,18 +212,51 @@ function unwrapArray(maybe) {
   if (Array.isArray(maybe)) return maybe;
   if (!maybe || typeof maybe !== "object") return null;
 
-  // common wrappers
-  const keys = ["data", "items", "results", "schedules", "ScheduleList", "appointments", "ApptList", "slots", "Slots"];
+  const keys = ["data", "items", "results", "schedules", "appointments", "slots", "Slots"];
   for (const k of keys) {
     if (Array.isArray(maybe[k])) return maybe[k];
   }
 
-  // fallback: first array value inside object
   for (const v of Object.values(maybe)) {
     if (Array.isArray(v)) return v;
   }
 
   return null;
+}
+
+// ✅ Key fix: build a DateTime from either:
+// - full datetime string
+// - OR date field + time-only string ("08:00:00")
+function parseScheduleDateTime(obj, timeValue, preferredDate) {
+  if (!timeValue) return null;
+
+  const raw = String(timeValue).trim();
+
+  // If it's already a full datetime, parse normally
+  const dt = parseOdDateTime(raw);
+  if (dt) return dt;
+
+  // If it's time-only like "08:00:00" or "08:00"
+  const isTimeOnly = /^\d{1,2}:\d{2}(:\d{2})?$/.test(raw);
+  if (!isTimeOnly) return null;
+
+  // Find schedule date in obj if preferredDate not provided
+  const dateCandidates = [
+    preferredDate,
+    obj.SchedDate,
+    obj.schedDate,
+    obj.Date,
+    obj.date,
+    obj.ScheduleDate,
+    obj.scheduleDate,
+  ].filter(Boolean);
+
+  const dateStr = normalizeDateOnly(dateCandidates[0] || "");
+  if (!dateStr) return null;
+
+  // Combine: YYYY-MM-DD + T + HH:MM:SS
+  const hhmmss = raw.length === 5 ? `${raw}:00` : raw; // "08:00" -> "08:00:00"
+  return new Date(`${dateStr}T${hhmmss}`);
 }
 
 // -------------------- TOOLS --------------------
@@ -294,16 +329,6 @@ async function tool_getUpcomingAppointments(params) {
   return { appointments: upcoming };
 }
 
-/**
- * Tool 3: Find available slots
- * Inputs:
- *  - startDate, endDate (YYYY-MM-DD)
- *  - durationMinutes (default 60)
- *  - incrementMinutes (default 10)
- *  - providerId (optional)
- *  - locationId/clinicNum (optional, default 0 if not provided)
- *  - opNum (optional)
- */
 async function tool_getAvailableSlots(params) {
   const today = new Date();
   const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
@@ -329,46 +354,7 @@ async function tool_getAvailableSlots(params) {
       ? Number(params.opNum)
       : null;
 
-  // --- 1) Try native slots endpoints (if supported) ---
-  const nativeCandidates = [
-    // Most common in OD docs: /appointments/slots
-    `/appointments/slots?dateStart=${encodeURIComponent(startDate)}&dateEnd=${encodeURIComponent(endDate)}&lengthMinutes=${encodeURIComponent(
-      String(durationMinutes)
-    )}` +
-      (providerId ? `&ProvNum=${encodeURIComponent(String(providerId))}` : "") +
-      (opNum ? `&OpNum=${encodeURIComponent(String(opNum))}` : "") +
-      (locationId !== null ? `&ClinicNum=${encodeURIComponent(String(locationId))}` : ""),
-  ];
-
-  for (const path of nativeCandidates) {
-    const resp = await odGetMaybe(path);
-    if (resp.ok) {
-      const list = unwrapArray(resp.data);
-      if (Array.isArray(list) && list.length) {
-        const slots = list.slice(0, 60).map((s) => {
-          const start = s.StartDateTime ?? s.DateTimeStart ?? s.startDateTime ?? s.start ?? null;
-          const end = s.EndDateTime ?? s.DateTimeStop ?? s.endDateTime ?? s.end ?? null;
-
-          const sd = parseOdDateTime(start);
-          const ed = end ? parseOdDateTime(end) : sd ? new Date(sd.getTime() + durationMinutes * 60000) : null;
-
-          return {
-            startDateTime: start || (sd ? formatOdDateTime(sd) : null),
-            endDateTime: end || (ed ? formatOdDateTime(ed) : null),
-            providerId: s.ProvNum ?? s.providerId ?? providerId ?? null,
-            locationId: s.ClinicNum ?? s.clinicNum ?? locationId ?? 0,
-            opNum: s.OpNum ?? s.Op ?? s.opNum ?? opNum ?? null,
-          };
-        }).filter(x => x.startDateTime && x.endDateTime);
-
-        return { slots, source: "native", nativePath: path };
-      }
-      // native returned ok but no array / empty array -> continue to computed
-    }
-    // if native errored -> fall through to computed
-  }
-
-  // --- 2) Computed fallback: schedules - busy appts = free time ---
+  // --- schedules ---
   const scheduleCandidates = [
     `/schedules?dateStart=${encodeURIComponent(startDate)}&dateEnd=${encodeURIComponent(endDate)}`,
     `/schedules`,
@@ -393,15 +379,10 @@ async function tool_getAvailableSlots(params) {
   }
 
   if (!Array.isArray(schedules)) {
-    return {
-      ok: false,
-      error: "Could not fetch schedules from Open Dental.",
-      scheduleSource,
-      scheduleError,
-    };
+    return { ok: false, error: "Could not fetch schedules from Open Dental.", scheduleSource, scheduleError };
   }
 
-  // Pull appointments in range if possible; otherwise pull all appointments and filter locally.
+  // --- appointments in range ---
   const apptCandidates = [
     `/appointments?dateStart=${encodeURIComponent(startDate)}&dateEnd=${encodeURIComponent(endDate)}`,
     `/appointments`,
@@ -425,15 +406,22 @@ async function tool_getAvailableSlots(params) {
     }
   }
 
-  // Normalize schedule blocks
+  // Normalize schedule blocks (date+time support)
   const blocks = schedules
     .map((s) => {
-      const start = s.StartTime ?? s.DateTimeStart ?? s.StartDateTime ?? s.startTime ?? s.dateTimeStart ?? null;
-      const stop = s.StopTime ?? s.DateTimeStop ?? s.EndDateTime ?? s.stopTime ?? s.dateTimeStop ?? null;
+      const schedDate = normalizeDateOnly(
+        s.SchedDate ?? s.schedDate ?? s.Date ?? s.date ?? s.ScheduleDate ?? s.scheduleDate ?? ""
+      );
+
+      const startRaw = s.StartTime ?? s.DateTimeStart ?? s.StartDateTime ?? s.startTime ?? s.dateTimeStart ?? null;
+      const stopRaw = s.StopTime ?? s.DateTimeStop ?? s.EndDateTime ?? s.stopTime ?? s.dateTimeStop ?? null;
+
+      const start = parseScheduleDateTime(s, startRaw, schedDate);
+      const end = parseScheduleDateTime(s, stopRaw, schedDate);
 
       return {
-        start: parseOdDateTime(start),
-        end: parseOdDateTime(stop),
+        start,
+        end,
         providerId: s.ProvNum ?? s.provNum ?? s.providerId ?? null,
         locationId: s.ClinicNum ?? s.clinicNum ?? s.locationId ?? null,
         opNum: s.Op ?? s.OpNum ?? s.opNum ?? null,
@@ -442,7 +430,6 @@ async function tool_getAvailableSlots(params) {
     })
     .filter((b) => b.start && b.end && b.end > b.start);
 
-  // Filter schedule blocks to requested provider/clinic/op if present
   const filteredBlocks = blocks.filter((b) => {
     if (locationId !== null && b.locationId !== null && Number(b.locationId) !== Number(locationId)) return false;
     if (providerId && b.providerId && Number(b.providerId) !== Number(providerId)) return false;
@@ -450,7 +437,7 @@ async function tool_getAvailableSlots(params) {
     return true;
   });
 
-  // Normalize “busy” appointment blocks
+  // Busy appt blocks
   const busyAll = appts
     .map((a) => {
       const start = a.AptDateTime ?? a.startDateTime ?? null;
@@ -473,7 +460,6 @@ async function tool_getAvailableSlots(params) {
     })
     .filter(Boolean);
 
-  // Conservative: treat most statuses as blocking (ignore cancelled/broken)
   const isBlockingStatus = (st) => {
     const s = String(st || "").toLowerCase();
     if (!s) return true;
@@ -497,9 +483,8 @@ async function tool_getAvailableSlots(params) {
         out.push(f);
         continue;
       }
-      if (busyInterval.start <= f.start && busyInterval.end >= f.end) {
-        continue;
-      }
+      if (busyInterval.start <= f.start && busyInterval.end >= f.end) continue;
+
       if (busyInterval.start > f.start) {
         out.push({ start: f.start, end: new Date(Math.min(busyInterval.start.getTime(), f.end.getTime())) });
       }
@@ -525,7 +510,6 @@ async function tool_getAvailableSlots(params) {
     for (const f of free) {
       let cursor = new Date(f.start.getTime());
 
-      // align to increment
       const m = cursor.getMinutes();
       const aligned = Math.ceil(m / incrementMinutes) * incrementMinutes;
       cursor.setMinutes(aligned, 0, 0);
@@ -555,6 +539,11 @@ async function tool_getAvailableSlots(params) {
     scheduleSource,
     apptSource,
     apptError,
+    debug: {
+      scheduleBlocks: blocks.length,
+      filteredBlocks: filteredBlocks.length,
+      busyBlocks: busy.length,
+    },
   };
 }
 
