@@ -1,39 +1,36 @@
 import express from "express";
 import cors from "cors";
 
-const BRIDGE_BEARER_TOKEN = (process.env.BRIDGE_BEARER_TOKEN || "").trim();
-
-const OD_BASE_URL = (process.env.OD_BASE_URL || "").trim();
-const OD_AUTH_HEADER = (process.env.OD_AUTH_HEADER || "").trim();
-const OD_PROXY_BASE_URL = (process.env.OD_PROXY_BASE_URL || "").trim();
-
 const PORT = process.env.PORT || 3000;
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-app.get("/", (req, res) => res.status(200).send("alive-v3-node22"));
-app.get("/routes", (req, res) => res.json({ routes: ["GET /", "GET /routes", "POST /vapi"] }));
+app.get("/", (req, res) => res.status(200).send("alive-minimal-green"));
 
-function unauthorized(res) {
-  return res.status(401).json({ ok: false, error: "Unauthorized" });
-}
+app.get("/routes", (req, res) => {
+  res.json({ routes: ["GET /", "GET /routes", "POST /vapi"] });
+});
 
-function requireBearer(req, res) {
-  if (!BRIDGE_BEARER_TOKEN) return true;
-  const auth = (req.headers.authorization || "").trim();
-  const expected = `Bearer ${BRIDGE_BEARER_TOKEN}`;
-  if (auth !== expected) {
-    unauthorized(res);
-    return false;
-  }
-  return true;
-}
+// Minimal /vapi handler (echo back what Vapi sent)
+app.post("/vapi", (req, res) => {
+  const toolCallList = req.body?.toolCallList || req.body?.toolCalls || [];
+  const results = (Array.isArray(toolCallList) ? toolCallList : []).map((t) => ({
+    toolCallId: t?.id || t?.toolCallId || null,
+    result: {
+      ok: true,
+      echoToolName: t?.name || t?.toolName || "",
+      echoParameters: t?.parameters || t?.args || {},
+    },
+  }));
 
-async function httpJson(url, options = {}) {
-  const resp = await fetch(url, options);
-  const text = await resp.text();
+  res.json({ results });
+});
+
+app.listen(PORT, () => {
+  console.log("Server listening on port", PORT);
+});
   let data = null;
   try {
     data = text ? JSON.parse(text) : null;
