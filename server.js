@@ -2,390 +2,264 @@ import express from "express";
 import cors from "cors";
 
 const app = express();
-
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
-
-app.use((req, res, next) => {
-  console.log("REQ", req.method, req.path);
-  next();
-});
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 10000;
+const VERSION = process.env.VERSION || "vapi-bridge-clean-v1";
 
-const OD_BASE_URL = (process.env.OD_BASE_URL || "").trim();
-const OD_AUTH_HEADER = (process.env.OD_AUTH_HEADER || "").trim();
+// Optional: protect /vapi routes with bearer token (leave blank to disable)
+const BRIDGE_BEARER_TOKEN = (process.env.BRIDGE_BEARER_TOKEN || "").trim();
 
-app.get("/alive", (req, res) => {
-  res.status(200).send("alive");
-});
+// Open Dental API settings (Render Environment Variables)
+const OD_BASE_URL = (process.env.OD_BASE_URL || "").trim(); // e.g. https://api.opendental.com/api/v1
+const OD_AUTH_HEADER = (process.env.OD_AUTH_HEADER || "").trim(); // e.g. ODFHIR devKey/customerKey  (whatever your working format is)
 
-function getToolArgs(reqBody) {
-  try {
-    if (!reqBody) return {};
-    const msg = reqBody.message || reqBody;
+function mask(s) {
+  if (!s) return "";
+  if (s.length <= 8) return "***";
+  return s.slice(0, 4) + "..." + s.slice(-4);
+}
 
-    if (msg.toolCallList && msg.toolCallList.length) {
-      const tc = msg.toolCallList[0];
-      if (tc && typeof tc.toolInput === "object" && tc.toolInput) return tc.toolInput;
-    }
-
-    if (msg.toolCalls && msg.toolCalls.length) {
-      const tc = msg.toolCalls[0];
-      const args = tc?.function?.arguments;
-      if (typeof args === "string" && args.trim()) return JSON.parse(args);
-      if (typeof args === "object" && args) return args;
-    }
-
-    return reqBody;
-  } catch {
-    return {};
+function requireBearer(req, res) {
+  if (!BRIDGE_BEARER_TOKEN) return true;
+  const auth = (req.headers.authorization || "").trim();
+  if (!auth || auth !== `Bearer ${BRIDGE_BEARER_TOKEN}`) {
+    res.status(401).json({ ok: false, error: "Unauthorized" });
+    return false;
   }
+  return true;
 }
 
 async function odFetch(path, options = {}) {
-  if (!OD_BASE_URL) throw new Error("OD_BASE_URL missing");
-  if (!OD_AUTH_HEADER) throw new Error("OD_AUTH_HEADER missing");
+  if (!OD_BASE_URL) throw new Error("OD_BASE_URL is not set");
+  if (!OD_AUTH_HEADER) throw new Error("OD_AUTH_HEADER is not set");
 
-  const controller = new AbortController();
-  const timeoutMs = 9000;
-  const t = setTimeout(() => controller.abort(), timeoutMs);
+  const url = `${OD_BASE_URL}${path.startsWith("/") ? "" : "/"}${path}`;
 
-  const method = (options.method || "GET").toUpperCase();
-  console.log("OD OUT ->", method, path);
+  const headers = {
+    "Content-Type": "application/json",
+    "Authorization": OD_AUTH_HEADER,
+    ...(options.headers || {})
+  };
 
+  const resp = await fetch(url, {
+    method: options.method || "GET",
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+
+  const text = await resp.text();
+  let json = null;
   try {
-    const r = await fetch(`${OD_BASE_URL}${path}`, {
-      ...options,
-      method,
-      headers: {
-        Authorization: OD_AUTH_HEADER,
-        "Content-Type": "application/json",
-        ...(options.headers || {})
-      },
-      signal: controller.signal
-    });
-
-    const text = await r.text();
-    console.log("OD IN <-", method, path, "status", r.status, "bodyPreview", String(text).slice(0, 180));
-
-    return { status: r.status, text };
-  } catch (e) {
-    console.log("OD FAIL !!", method, path, String(e?.message || e));
-    throw e;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
+    json = text ? JSON.parse(text) : null;
   } catch {
-    return text;
+    json = null;
   }
+
+  return { status: resp.status, ok: resp.ok, text, json, url };
 }
 
-function toIsoDateOnly(d) {
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+function vapiOk(res, result, extra = {}) {
+  // Vapi-friendly: always include a top-level "result" string
+  return res.status(200).json({ ok: true, result, ...extra });
 }
 
-function nextBusinessDaysStart(countDays) {
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
-
-  const dates = [];
-  let d = new Date(start);
-
-  while (dates.length < countDays) {
-    const day = d.getDay();
-    const isWeekend = day === 0 || day === 6;
-    if (!isWeekend) dates.push(new Date(d));
-    d.setDate(d.getDate() + 1);
-  }
-  return dates;
+function vapiFail(res, result, extra = {}, httpStatus = 200) {
+  // Keep HTTP 200 so Vapi reliably reads body; signal failure via ok:false
+  return res.status(httpStatus).json({ ok: false, result, ...extra });
 }
 
-function buildCandidateSlots(days, startHour, endHour, slotMinutes) {
-  const slots = [];
-  for (const day of days) {
-    const dayStart = new Date(day);
-    dayStart.setHours(startHour, 0, 0, 0);
+// ---------- Health / Debug ----------
+app.get("/alive", (req, res) => {
+  res.json({
+    ok: true,
+    version: VERSION,
+    hasBearer: !!BRIDGE_BEARER_TOKEN,
+    odBaseUrl: OD_BASE_URL,
+    odAuthHeaderPresent: !!OD_AUTH_HEADER,
+    odAuthHeaderMasked: mask(OD_AUTH_HEADER)
+  });
+});
 
-    const dayEnd = new Date(day);
-    dayEnd.setHours(endHour, 0, 0, 0);
-
-    let cursor = new Date(dayStart);
-    while (cursor.getTime() + slotMinutes * 60000 <= dayEnd.getTime()) {
-      const slotStart = new Date(cursor);
-      const slotEnd = new Date(cursor.getTime() + slotMinutes * 60000);
-      slots.push({ start: slotStart, end: slotEnd });
-      cursor = new Date(cursor.getTime() + slotMinutes * 60000);
-    }
-  }
-  return slots;
-}
-
-function overlaps(aStart, aEnd, bStart, bEnd) {
-  return aStart < bEnd && bStart < aEnd;
-}
-
-function normalizePhoneDigits(s) {
-  return String(s || "").replace(/\D/g, "");
-}
-
-function isTitleWord(w) {
-  const t = String(w || "").toLowerCase().replace(/\./g, "");
-  return t === "mr" || t === "mrs" || t === "ms" || t === "dr";
-}
-
-function extractLastNameFromAnyName(name) {
-  const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
-  const filtered = parts.filter((p) => !isTitleWord(p));
-  if (!filtered.length) return "";
-  return filtered[filtered.length - 1];
-}
-
-/* Optional browser testing */
+// Browser-friendly test: /od/try?path=/patients?LName=Smith
 app.get("/od/try", async (req, res) => {
+  const path = req.query.path;
+  if (!path || typeof path !== "string") {
+    return res.status(400).json({ ok: false, error: "Provide ?path=/..." });
+  }
   try {
-    const path = req.query.path;
-    if (!path) return res.status(400).json({ ok: false, error: "missing path" });
-
-    const r = await odFetch(String(path));
+    const r = await odFetch(path, { method: "GET" });
     return res.status(200).json({
       ok: true,
       path,
       status: r.status,
-      data: safeJsonParse(r.text)
+      url: r.url,
+      data: r.json ?? r.text
     });
   } catch (e) {
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+    return res.status(200).json({ ok: false, error: e.message });
   }
 });
 
-/* =========================
-   TOOL: opendental_findPatient
-========================= */
+// ---------- Helpers ----------
+function normalizeLastName(input) {
+  if (!input) return "";
+  let s = String(input).trim();
 
+  // Remove titles and punctuation
+  s = s.replace(/\b(mr|mrs|ms|dr)\.?\b/gi, "").trim();
+  s = s.replace(/[.,;:"'`]/g, "").trim();
+
+  // If someone spelled letters: "d u r s t" -> "durst"
+  if (/^([a-zA-Z]\s+){2,}[a-zA-Z]$/.test(s)) {
+    s = s.replace(/\s+/g, "");
+  }
+
+  // If full name given, take last token
+  const parts = s.split(/\s+/).filter(Boolean);
+  if (parts.length > 1) s = parts[parts.length - 1];
+
+  // Capitalize
+  s = s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+  return s;
+}
+
+// ---------- Vapi Tool Routes ----------
 app.post("/vapi/opendental_findPatient", async (req, res) => {
+  if (!requireBearer(req, res)) return;
+
   try {
-    const args = getToolArgs(req.body);
+    const payload = req.body || {};
+    const toolCall =
+      payload?.message?.toolCalls?.[0] ||
+      payload?.message?.toolCallList?.[0] ||
+      null;
 
-    let lastName = (args.lastName || "").trim();
-    if (!lastName && args.name) lastName = extractLastNameFromAnyName(args.name);
+    const args = toolCall?.function?.arguments || toolCall?.arguments || payload || {};
+    const lastNameRaw = args.lastName || args.LName || args.lname;
 
+    const lastName = normalizeLastName(lastNameRaw);
     if (!lastName) {
-      return res.status(200).json({ ok: false, error: "lastName required" });
+      return vapiFail(res, "I didn’t catch the last name. What is your last name?");
     }
 
-    const r = await odFetch(`/patients?LName=${encodeURIComponent(lastName)}`);
-    const data = safeJsonParse(r.text);
+    const r = await odFetch(`/patients?LName=${encodeURIComponent(lastName)}`, { method: "GET" });
 
-    return res.status(200).json({ ok: true, data });
-  } catch (e) {
-    console.error("findPatient error:", e);
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
-  }
-});
+    if (!r.ok) {
+      return vapiFail(
+        res,
+        "I’m having trouble reaching the scheduling system right now.",
+        { status: r.status, raw: r.json ?? r.text }
+      );
+    }
 
-/* =========================
-   TOOL: opendental_getUpcomingAppointments
-   Inputs expected: patNum (number) optional
-========================= */
+    const list = Array.isArray(r.json) ? r.json : r.json?.data || r.json;
+    const patients = Array.isArray(list) ? list : [];
 
-app.post("/vapi/opendental_getUpcomingAppointments", async (req, res) => {
-  try {
-    const args = getToolArgs(req.body);
-    const patNum = args.patNum ?? args.PatNum ?? null;
-
-    const r = await odFetch(`/appointments`);
-    const appts = safeJsonParse(r.text);
-
-    if (!Array.isArray(appts)) {
-      return res.status(200).json({
-        ok: false,
-        error: "Unexpected appointments response",
-        raw: appts
+    if (patients.length === 0) {
+      return vapiOk(res, `I don’t see anyone with the last name ${lastName}. Are you a new patient?`, {
+        patients: []
       });
     }
 
-    const now = Date.now();
-    const filtered = appts
-      .filter((a) => {
-        if (patNum == null) return true;
-        return String(a.PatNum) === String(patNum);
-      })
-      .filter((a) => {
-        const dt = new Date(a.AptDateTime || a.AptDate || a.DateTime || a.DateT || a.DateTimeStart || 0).getTime();
-        return Number.isFinite(dt) && dt >= now;
-      })
-      .slice(0, 20);
+    if (patients.length === 1) {
+      const p = patients[0];
+      return vapiOk(res, `Found ${p.FName} ${p.LName}.`, {
+        patients,
+        patNum: p.PatNum
+      });
+    }
 
-    return res.status(200).json({ ok: true, appointments: filtered });
+    return vapiOk(res, `I found multiple patients with the last name ${lastName}. What is the date of birth?`, {
+      patients
+    });
   } catch (e) {
-    console.error("getUpcomingAppointments error:", e);
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+    return vapiFail(res, "Something went wrong while searching for the patient.", { error: e.message });
   }
 });
-
-/* =========================
-   TOOL: opendental_getAvailableTimes
-   This ACTUALLY calls Open Dental to pull existing appointments,
-   then computes open slots.
-   Inputs you can pass from Vapi prompt/tool:
-     slotMinutes (default 60)
-     daysAhead (default 7)
-========================= */
 
 app.post("/vapi/opendental_getAvailableTimes", async (req, res) => {
+  if (!requireBearer(req, res)) return;
+
   try {
-    const args = getToolArgs(req.body);
-    console.log("Availability tool args:", args);
+    // IMPORTANT: You must adjust the OD endpoint used here to match your Open Dental API for availability.
+    // We'll start by calling a placeholder endpoint you can replace once confirmed.
+    //
+    // For now, return a clear message so Vapi never says "No result returned".
+    // Then we can wire the exact availability endpoint you want.
 
-    const slotMinutes = Number(args.slotMinutes || 60);
-    const daysAhead = Number(args.daysAhead || 7);
-
-    const workStartHour = 9;
-    const workEndHour = 17;
-
-    const days = nextBusinessDaysStart(daysAhead);
-    const candidates = buildCandidateSlots(days, workStartHour, workEndHour, slotMinutes);
-
-    const r = await odFetch(`/appointments`);
-    const appts = safeJsonParse(r.text);
-
-    if (!Array.isArray(appts)) {
-      return res.status(200).json({
-        ok: false,
-        error: "Unexpected appointments response from Open Dental",
-        raw: appts
-      });
-    }
-
-    const busy = appts
-      .map((a) => {
-        const start = new Date(a.AptDateTime || a.DateTimeStart || a.AptDate || a.DateTime || 0);
-        let minutes = Number(a.Length || a.Minutes || a.Duration || 60);
-        if (!Number.isFinite(minutes) || minutes <= 0) minutes = 60;
-        const end = new Date(start.getTime() + minutes * 60000);
-        return { start, end };
-      })
-      .filter((b) => Number.isFinite(b.start.getTime()));
-
-    const openSlots = [];
-    for (const c of candidates) {
-      const blocked = busy.some((b) => overlaps(c.start, c.end, b.start, b.end));
-      if (!blocked) {
-        openSlots.push({
-          startISO: c.start.toISOString(),
-          endISO: c.end.toISOString(),
-          date: toIsoDateOnly(c.start),
-          display: c.start.toLocaleString("en-US", { weekday: "long", month: "long", day: "numeric", hour: "numeric", minute: "2-digit" })
-        });
-      }
-      if (openSlots.length >= 6) break;
-    }
-
-    return res.status(200).json({
-      ok: true,
-      openSlots,
-      note: openSlots.length ? "computed from existing Open Dental appointments" : "no open slots found in computed window"
-    });
+    // If you already have an availability endpoint working in your old code, paste it here.
+    return vapiOk(
+      res,
+      "I can check availability, but the availability endpoint still needs to be mapped to your Open Dental API configuration.",
+      { hint: "Once you confirm the exact Open Dental availability endpoint and required params, we’ll wire it in." }
+    );
   } catch (e) {
-    console.error("getAvailableTimes error:", e);
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+    return vapiFail(res, "Something went wrong while checking availability.", { error: e.message });
   }
 });
-
-/* =========================
-   TOOL: opendental_createAppointment
-   This attempts a REAL create via Open Dental POST /appointments
-   You must provide the fields Open Dental requires.
-   We do not guess required fields.
-   Whatever Open Dental returns will be surfaced.
-========================= */
 
 app.post("/vapi/opendental_createAppointment", async (req, res) => {
+  if (!requireBearer(req, res)) return;
+
   try {
-    const args = getToolArgs(req.body);
-    console.log("CreateAppointment tool args:", args);
-
-    const body = args;
-
-    const r = await odFetch(`/appointments`, {
-      method: "POST",
-      body: JSON.stringify(body)
-    });
-
-    const data = safeJsonParse(r.text);
-
-    return res.status(200).json({
-      ok: r.status >= 200 && r.status < 300,
-      status: r.status,
-      data
-    });
+    // NOTE: appointment creation also needs exact endpoint + required fields.
+    return vapiOk(
+      res,
+      "Appointment creation is connected, but the create endpoint and required fields still need to be mapped to your Open Dental API configuration.",
+      { hint: "Next step is wiring the exact create appointment payload (patNum, operatory, provider, start time, length, etc.)." }
+    );
   } catch (e) {
-    console.error("createAppointment error:", e);
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+    return vapiFail(res, "Something went wrong while creating the appointment.", { error: e.message });
   }
 });
 
-/* =========================
-   TOOL: opendental_rescheduleAppointment
-   Attempts PUT /appointments (surface OD response)
-========================= */
+app.post("/vapi/opendental_getUpcomingAppointments", async (req, res) => {
+  if (!requireBearer(req, res)) return;
+
+  try {
+    return vapiOk(
+      res,
+      "Upcoming appointments lookup is connected, but the endpoint mapping still needs to be finalized.",
+      { hint: "We’ll wire the correct /appointments query once we confirm Open Dental’s exact schema in your tenant." }
+    );
+  } catch (e) {
+    return vapiFail(res, "Something went wrong while checking upcoming appointments.", { error: e.message });
+  }
+});
 
 app.post("/vapi/opendental_rescheduleAppointment", async (req, res) => {
+  if (!requireBearer(req, res)) return;
+
   try {
-    const args = getToolArgs(req.body);
-    console.log("Reschedule tool args:", args);
-
-    const r = await odFetch(`/appointments`, {
-      method: "PUT",
-      body: JSON.stringify(args)
-    });
-
-    return res.status(200).json({
-      ok: r.status >= 200 && r.status < 300,
-      status: r.status,
-      data: safeJsonParse(r.text)
-    });
+    return vapiOk(
+      res,
+      "Rescheduling is connected, but the endpoint mapping still needs to be finalized.",
+      { hint: "We’ll wire it after we confirm how appointment IDs and updates work in your Open Dental API." }
+    );
   } catch (e) {
-    console.error("rescheduleAppointment error:", e);
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+    return vapiFail(res, "Something went wrong while rescheduling.", { error: e.message });
   }
 });
-
-/* =========================
-   TOOL: opendental_cancelAppointment
-   Attempts DELETE /appointments (surface OD response)
-========================= */
 
 app.post("/vapi/opendental_cancelAppointment", async (req, res) => {
+  if (!requireBearer(req, res)) return;
+
   try {
-    const args = getToolArgs(req.body);
-    console.log("Cancel tool args:", args);
-
-    const r = await odFetch(`/appointments`, {
-      method: "DELETE",
-      body: JSON.stringify(args)
-    });
-
-    return res.status(200).json({
-      ok: r.status >= 200 && r.status < 300,
-      status: r.status,
-      data: safeJsonParse(r.text)
-    });
+    return vapiOk(
+      res,
+      "Cancellation is connected, but the endpoint mapping still needs to be finalized.",
+      { hint: "We’ll wire the correct cancel/update status endpoint once we confirm the correct fields." }
+    );
   } catch (e) {
-    console.error("cancelAppointment error:", e);
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+    return vapiFail(res, "Something went wrong while cancelling.", { error: e.message });
   }
 });
 
+// ---------- Start ----------
 app.listen(PORT, () => {
-  console.log(`listening on ${PORT}`);
+  console.log(`listening on ${PORT} (${VERSION})`);
+  console.log(`OD_BASE_URL=${OD_BASE_URL}`);
+  console.log(`OD_AUTH_HEADER present=${!!OD_AUTH_HEADER} masked=${mask(OD_AUTH_HEADER)}`);
 });
